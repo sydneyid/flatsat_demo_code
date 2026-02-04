@@ -1,0 +1,9 @@
+# Pip requirements for record_filter_display.py (use in venv or conda)
+# Metavision SDK must be installed separately (Prophesee/OpenEB).
+
+numpy>=1.26
+numba>=0.61
+scipy
+opencv-python
+h5py
+sk-video
