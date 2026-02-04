@@ -50,8 +50,8 @@ except ImportError:
 RECORD_DURATION_S = 10
 CALIBRATION_DURATION_S = 0.1  # Short recording to identify hot pixels before main recording
 HOT_PIXEL_TOP_K = 10
-# Skip hardware hot-pixel mask; some setups segfault when recording with mask active. Hot pixels removed in software.
-SKIP_HARDWARE_HOT_PIXEL_MASK = True
+# Set False to mask hot pixels in hardware before main recording (applied after device reopen). Set True to skip and remove in software only.
+SKIP_HARDWARE_HOT_PIXEL_MASK = False
 FRAME_FPS = 25
 DELTA_T_US = 10000  # 10 ms slices for iteration
 
@@ -571,11 +571,11 @@ def load_events_from_raw(raw_path, hot_pixels=None, delta_t_us=DELTA_T_US):
 
 def filter_and_save_raw(
     input_raw_path, output_raw_path, hot_pixels, width, height,
-    apply_activity=True, apply_neighborhood=True,
+    apply_activity=True, apply_neighborhood=False,
 ):
     """
-    Load events from RAW, remove hot pixels, apply activity (500ms 10x10) and
-    neighborhood (200ms 3x3, count > 3) in a single pass when both enabled and Numba available.
+    Load events from RAW, remove hot pixels, apply activity filter (500ms 10x10) only by default.
+    Set apply_neighborhood=True to also apply neighborhood (200ms 3x3).
     Returns (width, height, stats) where stats is a dict with n_original, n_filtered, t_min_us, t_max_us.
     """
     print("  Loading events...")
@@ -917,7 +917,7 @@ def main():
         del mv_it
         hot_pixels = set()
         original_size_bytes = os.path.getsize(raw_path)
-        print(f"Filtering (activity + neighborhood) and writing to RAW: {raw_path}")
+        print(f"Filtering (activity only) and writing to RAW: {raw_path}")
         width, height, stats = filter_and_save_raw(
             raw_path, filtered_raw_path, hot_pixels, width, height,
             apply_activity=True, apply_neighborhood=False,
@@ -969,28 +969,28 @@ def main():
     hot_pixels, w2, h2 = find_hot_pixels(calib_raw_path, top_k=HOT_PIXEL_TOP_K)
     width, height = w2, h2
     print("Hot pixels (x,y):", sorted(hot_pixels))
-    # Mask hot pixels at hardware so they are not output during the main recording (skip if SKIP_HARDWARE_HOT_PIXEL_MASK: some drivers segfault)
-    mask_applied = False
-    if not SKIP_HARDWARE_HOT_PIXEL_MASK:
-        mask_applied = apply_hot_pixel_mask(device, hot_pixels)
-    if mask_applied:
-        print("Hot pixels masked at hardware; they will be excluded from the main recording.")
-    else:
-        if SKIP_HARDWARE_HOT_PIXEL_MASK:
-            print("Hardware mask disabled (SKIP_HARDWARE_HOT_PIXEL_MASK); hot pixels will be removed in software after recording.")
-        else:
-            print("Hardware mask not available on this device; hot pixels will be removed in software after recording.")
-            print("  (Prophesee: run 'metavision_active_pixel_detection' to detect and save calibration;")
-            print("   for GenX320 use default calib path; for Gen4.1/IMX636 use Digital Event Mask in camera settings.)")
+    if SKIP_HARDWARE_HOT_PIXEL_MASK:
+        print("Hardware mask skipped (SKIP_HARDWARE_HOT_PIXEL_MASK); hot pixels will be removed in software after recording.")
     try:
         os.remove(calib_raw_path)
     except OSError:
         pass
 
-    # Reopen device for main recording (avoids segfault on some setups when reusing after calibration)
+    # Reopen device for main recording (fresh handle avoids issues after calibration)
     del device
     print("Reopening camera for main recording...")
     device = initiate_device("")
+
+    # Apply hardware hot-pixel mask on the recording device (after reopen so mask is active for this session)
+    mask_applied = False
+    if not SKIP_HARDWARE_HOT_PIXEL_MASK:
+        mask_applied = apply_hot_pixel_mask(device, hot_pixels)
+        if mask_applied:
+            print("Hot pixels masked at hardware; they will be excluded from the main recording.")
+        else:
+            print("Hardware mask not available on this device; hot pixels will be removed in software after recording.")
+            print("  (Prophesee: run 'metavision_active_pixel_detection' to detect and save calibration;")
+            print("   for GenX320 use default calib path; for Gen4.1/IMX636 use Digital Event Mask in camera settings.)")
 
     # 2) Record 10 seconds (iterator drives stream so data is written)
     print(f"Recording main sequence for {RECORD_DURATION_S} seconds...")
@@ -1002,10 +1002,10 @@ def main():
         )
     print("Recording saved to", raw_path)
 
-    # 3) Apply activity and neighborhood filters; only apply software hot-pixel removal if mask was not applied
+    # 3) Apply activity filter only; software hot-pixel removal if hardware mask was not applied
     hot_pixels_for_load = None if mask_applied else hot_pixels
     original_size_bytes = os.path.getsize(raw_path)
-    print("Filtering (activity + neighborhood) and writing to RAW...")
+    print("Filtering (activity only) and writing to RAW...")
     width, height, stats = filter_and_save_raw(
         raw_path, filtered_raw_path, hot_pixels_for_load, width, height,
         apply_activity=True, apply_neighborhood=False,
