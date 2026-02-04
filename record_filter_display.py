@@ -239,10 +239,19 @@ def _sliding_window_filter(events, height, width, window_us, radius, min_count_s
     return _sliding_window_filter_python(events, height, width, window_us, radius, min_count_strict)
 
 
+# Chunk duration for KDTree filter: process in time chunks to keep trees smaller (faster build + query).
+KDTREE_CHUNK_DURATION_US = 1_000_000  # 1 second
+# Use Numba sliding-window for both filters when available (single-pass O(n), much faster for large streams).
+# If False, activity/neighborhood use chunked KDTree when scipy is available.
+USE_NUMBA_FOR_ACTIVITY = True
+USE_NUMBA_FOR_NEIGHBORHOOD = True
+
+
 def _kdtree_spatiotemporal_filter(events, window_us, spatial_radius, min_count, label=""):
     """
     Filter events using a 3D KDTree in (x, y, t_scaled) with Chebyshev distance.
     Keep event i iff the number of events in the box (2*spatial_radius in x,y and window_us in t) is >= min_count.
+    Processes in overlapping time chunks to reduce tree size and speed up build/query.
     """
     n = len(events)
     if n == 0:
@@ -254,28 +263,51 @@ def _kdtree_spatiotemporal_filter(events, window_us, spatial_radius, min_count, 
     t_scale = spatial_radius / float(window_us) if window_us else 1.0
     t_scaled = t * t_scale
     points = np.column_stack((x, y, t_scaled))
-    if label:
-        print(f"    Building KDTree ({label})...")
-    tree = cKDTree(points)
     radius = spatial_radius
+    keep_mask = np.ones(n, dtype=bool)
+
+    t_min, t_max = int(t[0]), int(t[-1])
+    chunk_duration = max(2 * window_us, KDTREE_CHUNK_DURATION_US)
+    n_chunks = max(1, (t_max - t_min + chunk_duration - 1) // chunk_duration)
     if label:
-        print(f"    Querying neighbors ({label})...")
-    neighbor_counts = tree.query_ball_point(points, r=radius, p=np.inf, return_length=True)
-    keep_mask = neighbor_counts >= min_count
+        print(f"    KDTree filter ({label}): {n_chunks} chunk(s)...")
+
+    for chunk_start in range(t_min, t_max + 1, chunk_duration):
+        chunk_end = min(chunk_start + chunk_duration, t_max + 1)
+        pad_start = chunk_start - window_us
+        pad_end = chunk_end + window_us
+        inner_mask = (t >= chunk_start) & (t < chunk_end)
+        pad_mask = (t >= pad_start) & (t < pad_end)
+        inner_indices = np.where(inner_mask)[0]
+        pad_indices = np.where(pad_mask)[0]
+        if len(inner_indices) == 0:
+            continue
+        points_pad = points[pad_indices]
+        tree = cKDTree(points_pad, leafsize=64)
+        neighbor_counts = tree.query_ball_point(
+            points[inner_indices], r=radius, p=np.inf, return_length=True
+        )
+        keep_mask[inner_indices] = neighbor_counts >= min_count
+
     return keep_mask
 
 
 def activity_filter(events, height, width):
-    """Keep event only if there is at least one similar event in 500ms and 10x10 neighborhood (cKDTree)."""
+    """Keep event only if there is at least one similar event in 500ms and 10x10 neighborhood."""
+    if USE_NUMBA_FOR_ACTIVITY and _NUMBA_AVAILABLE:
+        return _sliding_window_filter(
+            events, height, width,
+            ACTIVITY_WINDOW_US, ACTIVITY_RADIUS,
+            ACTIVITY_MIN_COUNT - 1,
+        )
     if _SCIPY_AVAILABLE:
-        keep = _kdtree_spatiotemporal_filter(
+        return _kdtree_spatiotemporal_filter(
             events,
             window_us=ACTIVITY_WINDOW_US,
             spatial_radius=ACTIVITY_RADIUS,
             min_count=ACTIVITY_MIN_COUNT,
             label="activity",
         )
-        return keep
     return _sliding_window_filter(
         events, height, width,
         ACTIVITY_WINDOW_US, ACTIVITY_RADIUS,
@@ -284,9 +316,14 @@ def activity_filter(events, height, width):
 
 
 def neighborhood_filter(events, height, width):
-    """Keep event only if sum of events in 3x3 over 250ms is > 3 (cKDTree)."""
+    """Keep event only if sum of events in 3x3 over 250ms is > 3."""
+    if USE_NUMBA_FOR_NEIGHBORHOOD and _NUMBA_AVAILABLE:
+        return _sliding_window_filter(
+            events, height, width,
+            NEIGHBOR_WINDOW_US, NEIGHBOR_RADIUS,
+            NEIGHBOR_MIN_COUNT,
+        )
     if _SCIPY_AVAILABLE:
-        # keep iff count > NEIGHBOR_MIN_COUNT (i.e. at least NEIGHBOR_MIN_COUNT + 1 events)
         keep = _kdtree_spatiotemporal_filter(
             events,
             window_us=NEIGHBOR_WINDOW_US,
@@ -502,6 +539,7 @@ def iter_events_from_hdf5(hdf5_path, delta_t_us=DELTA_T_US):
 def events_to_mp4(event_file_path, mp4_path, width, height):
     """Render event file (RAW or HDF5 with t,x,y,p) to MP4 using periodic frame generation.
     Streams frames to disk as they are generated (when using OpenCV) to save memory and time.
+    ON (polarity 1) = white, OFF (polarity 0) = blue.
     """
     frame_gen = PeriodicFrameGenerationAlgorithm(
         sensor_width=width,
@@ -509,6 +547,14 @@ def events_to_mp4(event_file_path, mp4_path, width, height):
         fps=FRAME_FPS,
         palette=ColorPalette.Dark,
     )
+    # ON events = white, OFF events = blue (BGR)
+    bg_bgr = (0, 0, 0)  # black background
+    on_bgr = (255, 255, 255)  # white
+    off_bgr = (255, 0, 0)  # blue
+    try:
+        frame_gen.set_colors(bg_bgr, on_bgr, off_bgr, True)
+    except (TypeError, AttributeError):
+        pass  # keep default palette if set_colors signature differs
     frames = []  # used only when not streaming (no OpenCV)
     frame_count = [0]
 
