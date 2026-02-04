@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Record from a Metavision event camera: run a short calibration (0.1 s) to identify
-hot pixels, mask them at hardware (if supported), then record 20 s with hot pixels
+hot pixels, mask them at hardware (if supported), then record 10 s with hot pixels
 already excluded. Apply activity (500 ms, 10x10) and neighborhood (250 ms, 3x3)
 filters, write to RAW, render to MP4, and display.
 
@@ -46,7 +46,7 @@ try:
 except ImportError:
     HAS_CV2 = False
 
-RECORD_DURATION_S = 20
+RECORD_DURATION_S = 10
 CALIBRATION_DURATION_S = 0.1  # Short recording to identify hot pixels before main recording
 HOT_PIXEL_TOP_K = 10
 FRAME_FPS = 25
@@ -65,7 +65,7 @@ NEIGHBOR_MIN_COUNT = 3  # keep only if count > 3 (i.e. at least 4 events in 3x3 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Record 20s, apply activity + neighborhood filters, save RAW and show MP4.",
+        description="Record 10s, apply activity + neighborhood filters, save RAW and show MP4.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -618,7 +618,7 @@ def main():
     except OSError:
         pass
 
-    # 2) Record 20 seconds (with hot pixels already masked if supported)
+    # 2) Record 10 seconds (with hot pixels already masked if supported)
     print(f"Recording main sequence for {RECORD_DURATION_S} seconds...")
     width, height = record_seconds(device, raw_path, duration_s=RECORD_DURATION_S)
     if not os.path.isfile(raw_path):
