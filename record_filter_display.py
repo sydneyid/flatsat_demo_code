@@ -239,8 +239,8 @@ def _sliding_window_filter(events, height, width, window_us, radius, min_count_s
     return _sliding_window_filter_python(events, height, width, window_us, radius, min_count_strict)
 
 
-# Chunk duration for KDTree filter: process in time chunks to keep trees smaller (faster build + query).
-KDTREE_CHUNK_DURATION_US = 1_000_000  # 1 second
+# Chunk duration for KDTree filter when scipy is used: smaller = faster per tree, more chunks (0.5s is a good balance).
+KDTREE_CHUNK_DURATION_US = 500_000  # 0.5 second
 # Use Numba sliding-window for both filters when available (single-pass O(n), much faster for large streams).
 # If False, activity/neighborhood use chunked KDTree when scipy is available.
 USE_NUMBA_FOR_ACTIVITY = True
@@ -267,7 +267,7 @@ def _kdtree_spatiotemporal_filter(events, window_us, spatial_radius, min_count, 
     keep_mask = np.ones(n, dtype=bool)
 
     t_min, t_max = int(t[0]), int(t[-1])
-    chunk_duration = max(2 * window_us, KDTREE_CHUNK_DURATION_US)
+    chunk_duration = max(window_us + 1, KDTREE_CHUNK_DURATION_US)  # ensure chunk has room; smaller = faster per tree
     n_chunks = max(1, (t_max - t_min + chunk_duration - 1) // chunk_duration)
     if label:
         print(f"    KDTree filter ({label}): {n_chunks} chunk(s)...")
@@ -295,12 +295,14 @@ def _kdtree_spatiotemporal_filter(events, window_us, spatial_radius, min_count, 
 def activity_filter(events, height, width):
     """Keep event only if there is at least one similar event in 500ms and 10x10 neighborhood."""
     if USE_NUMBA_FOR_ACTIVITY and _NUMBA_AVAILABLE:
+        print("    Activity filter: using Numba (sliding-window)")
         return _sliding_window_filter(
             events, height, width,
             ACTIVITY_WINDOW_US, ACTIVITY_RADIUS,
             ACTIVITY_MIN_COUNT - 1,
         )
     if _SCIPY_AVAILABLE:
+        print("    Activity filter: using scipy (chunked KDTree)")
         return _kdtree_spatiotemporal_filter(
             events,
             window_us=ACTIVITY_WINDOW_US,
@@ -308,6 +310,7 @@ def activity_filter(events, height, width):
             min_count=ACTIVITY_MIN_COUNT,
             label="activity",
         )
+    print("    Activity filter: using Python (sliding-window fallback)")
     return _sliding_window_filter(
         events, height, width,
         ACTIVITY_WINDOW_US, ACTIVITY_RADIUS,
@@ -318,12 +321,14 @@ def activity_filter(events, height, width):
 def neighborhood_filter(events, height, width):
     """Keep event only if sum of events in 3x3 over 250ms is > 3."""
     if USE_NUMBA_FOR_NEIGHBORHOOD and _NUMBA_AVAILABLE:
+        print("    Neighborhood filter: using Numba (sliding-window)")
         return _sliding_window_filter(
             events, height, width,
             NEIGHBOR_WINDOW_US, NEIGHBOR_RADIUS,
             NEIGHBOR_MIN_COUNT,
         )
     if _SCIPY_AVAILABLE:
+        print("    Neighborhood filter: using scipy (chunked KDTree)")
         keep = _kdtree_spatiotemporal_filter(
             events,
             window_us=NEIGHBOR_WINDOW_US,
@@ -332,6 +337,7 @@ def neighborhood_filter(events, height, width):
             label="neighborhood",
         )
         return keep
+    print("    Neighborhood filter: using Python (sliding-window fallback)")
     return _sliding_window_filter(
         events, height, width,
         NEIGHBOR_WINDOW_US, NEIGHBOR_RADIUS,
@@ -393,6 +399,15 @@ def filter_and_save_raw(
         writer.flush()
         writer.close()
         return width, height, {"n_original": 0, "n_filtered": 0, "t_min_us": 0, "t_max_us": 0}
+    # Report which backends are available (Numba preferred; scipy = chunked KDTree)
+    backends = []
+    if _NUMBA_AVAILABLE:
+        backends.append("Numba")
+    if _SCIPY_AVAILABLE:
+        backends.append("scipy")
+    if not backends:
+        backends.append("Python fallback")
+    print("  Filter backends available:", ", ".join(backends))
     if apply_activity:
         print("  Applying activity filter (500ms, 10x10)...")
         keep = activity_filter(events, height, width)
@@ -677,10 +692,10 @@ def main():
     # 3) Apply activity and neighborhood filters; only apply software hot-pixel removal if mask was not applied
     hot_pixels_for_load = None if mask_applied else hot_pixels
     original_size_bytes = os.path.getsize(raw_path)
-    print("Filtering (activity + neighborhood) and writing to RAW...")
+    print("Filtering (activity only) and writing to RAW...")
     width, height, stats = filter_and_save_raw(
         raw_path, filtered_raw_path, hot_pixels_for_load, width, height,
-        apply_activity=True, apply_neighborhood=True,
+        apply_activity=True, apply_neighborhood=False,
     )
     filtered_size_bytes = os.path.getsize(filtered_raw_path)
     n_orig, n_filt = stats["n_original"], stats["n_filtered"]
