@@ -1,0 +1,31 @@
+# Conda environment for record_filter_display.py
+# Create: conda env create -f environment.yml
+# Activate: conda activate metavision-record
+#
+# Note: Metavision SDK (metavision_core, metavision_sdk_*) is not on conda.
+# Install it separately via Prophesee/OpenEB (e.g. their installer or pip index)
+# and use the same Python as this env, or activate this env and run their
+# install so the SDK is available in this environment.
+
+name: metavision-record
+
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python>=3.10,<3.13
+  - numpy>=1.26,<2.3
+  - numba>=0.61
+  - scipy
+  - opencv
+  - h5py
+  - pip
+
+  # Optional: MP4 fallback if OpenCV doesn't work (skvideo)
+  - pip:
+    - sk-video
+
+# Optional: if you need to pin NumPy 1.x for Numba compatibility on ARM/Jetson, use:
+#   - numpy>=1.26,<2
+# and ensure numba is installed after: pip install numba
