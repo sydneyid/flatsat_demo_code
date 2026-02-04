@@ -13,6 +13,7 @@ import argparse
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 
@@ -49,6 +50,8 @@ except ImportError:
 RECORD_DURATION_S = 10
 CALIBRATION_DURATION_S = 0.1  # Short recording to identify hot pixels before main recording
 HOT_PIXEL_TOP_K = 10
+# Skip hardware hot-pixel mask; some setups segfault when recording with mask active. Hot pixels removed in software.
+SKIP_HARDWARE_HOT_PIXEL_MASK = True
 FRAME_FPS = 25
 DELTA_T_US = 10000  # 10 ms slices for iteration
 
@@ -57,15 +60,15 @@ ACTIVITY_WINDOW_US = 500_000  # 500 ms
 ACTIVITY_RADIUS = 5  # 10x10 = radius 5 on each side
 ACTIVITY_MIN_COUNT = 2  # keep event only if at least this many in window (incl. self)
 
-# Neighborhood filter: 250ms window, 3x3 kernel; drop if sum of events in 3x3 over 250ms is not > 3
-NEIGHBOR_WINDOW_US = 250_000  # 250 ms
+# Neighborhood filter: 200ms window, 3x3 kernel; remove if not > NEIGHBOR_MIN_COUNT events in 3x3 over 200ms
+NEIGHBOR_WINDOW_US = 200_000  # 200 ms
 NEIGHBOR_RADIUS = 1  # 3x3
-NEIGHBOR_MIN_COUNT = 3  # keep only if count > 3 (i.e. at least 4 events in 3x3 over 250ms)
+NEIGHBOR_MIN_COUNT = 2  # keep if count > 2 (i.e. >= 3 in 3x3); use 3 for stricter (>= 4 events)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Record 10s, apply activity + neighborhood filters, save RAW and show MP4.",
+        description="Record 10s (or use --input RAW), apply activity filter, save filtered RAW and show MP4.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -73,21 +76,37 @@ def parse_args():
         default=".",
         help="Directory for output RAW and MP4 files",
     )
+    parser.add_argument(
+        "-i", "--input",
+        default="",
+        help="Use existing RAW file instead of recording; filter and render to MP4 only (no camera)",
+    )
     return parser.parse_args()
 
 
 def record_seconds(device, output_raw_path, duration_s=RECORD_DURATION_S):
     """Record from device for duration_s seconds to a RAW file (no live preview). Returns (width, height)."""
-    if device.get_i_events_stream():
-        device.get_i_events_stream().log_raw_data(output_raw_path)
+    stream = device.get_i_events_stream() if hasattr(device, "get_i_events_stream") else None
+    if stream:
+        stream.log_raw_data(output_raw_path)
+
     mv_iterator = EventsIterator.from_device(device=device, delta_t=DELTA_T_US)
     height, width = mv_iterator.get_size()
     end_time = time.time() + duration_s
-    for evs in mv_iterator:
-        if time.time() >= end_time:
-            break
-    if device.get_i_events_stream():
-        device.get_i_events_stream().stop_log_raw_data()
+    try:
+        for evs in mv_iterator:
+            if time.time() >= end_time:
+                break
+    except RuntimeError as e:
+        if stream:
+            stream.stop_log_raw_data()
+        raise RuntimeError(
+            "Live recording decoder failed (std::exception). Record a RAW file with the Metavision app or "
+            "metavision_file_recorder, then run this script with --input <file.raw> to filter and render."
+        ) from e
+
+    if stream:
+        stream.stop_log_raw_data()
     return width, height
 
 
@@ -217,11 +236,65 @@ def _sliding_window_filter_numba(x, y, t, height, width, window_us, radius, min_
         y_hi = min(height, yi + radius + 1)
         x_lo = max(0, xi - radius)
         x_hi = min(width, xi + radius + 1)
-        count = 0
-        for yy in range(y_lo, y_hi):
-            for xx in range(x_lo, x_hi):
-                count += hist[yy, xx]
+        count = np.sum(hist[y_lo:y_hi, x_lo:x_hi])
         if count <= min_count_strict:
+            keep[i] = False
+    return keep
+
+
+@njit(cache=True)
+def _combined_activity_neighborhood_numba(
+    x, y, t, height, width,
+    activity_window_us, activity_radius, activity_min_count,
+    neighbor_window_us, neighbor_radius, neighbor_min_count,
+):
+    """
+    Single pass: activity (500ms, 10x10, keep if count >= 2) and neighborhood (200ms, 3x3, keep if count > 3).
+    Keep event only if both conditions pass.
+    """
+    n = x.size
+    keep = np.ones(n, dtype=np.bool_)
+    hist_500 = np.zeros((height, width), dtype=np.int32)
+    hist_200 = np.zeros((height, width), dtype=np.int32)
+    left_500 = 0
+    left_200 = 0
+    right = 0
+    for i in range(n):
+        t_i = t[i]
+        # Extend right: add events up to t_i + activity_window (500ms)
+        while right < n and t[right] <= t_i + activity_window_us:
+            xr, yr = x[right], y[right]
+            tr = t[right]
+            if 0 <= xr < width and 0 <= yr < height:
+                hist_500[yr, xr] += 1
+                if tr <= t_i + neighbor_window_us:
+                    hist_200[yr, xr] += 1
+            right += 1
+        # Shrink left: remove events outside time windows
+        while left_500 < n and t[left_500] < t_i - activity_window_us:
+            xl, yl = x[left_500], y[left_500]
+            if 0 <= xl < width and 0 <= yl < height:
+                hist_500[yl, xl] -= 1
+            left_500 += 1
+        while left_200 < n and t[left_200] < t_i - neighbor_window_us:
+            xl, yl = x[left_200], y[left_200]
+            if 0 <= xl < width and 0 <= yl < height:
+                hist_200[yl, xl] -= 1
+            left_200 += 1
+        xi, yi = x[i], y[i]
+        # Activity: 10x10, keep if count >= 2
+        ay_lo = max(0, yi - activity_radius)
+        ay_hi = min(height, yi + activity_radius + 1)
+        ax_lo = max(0, xi - activity_radius)
+        ax_hi = min(width, xi + activity_radius + 1)
+        count_activity = np.sum(hist_500[ay_lo:ay_hi, ax_lo:ax_hi])
+        # Neighborhood: 3x3, keep if count > 3
+        ny_lo = max(0, yi - neighbor_radius)
+        ny_hi = min(height, yi + neighbor_radius + 1)
+        nx_lo = max(0, xi - neighbor_radius)
+        nx_hi = min(width, xi + neighbor_radius + 1)
+        count_neighbor = np.sum(hist_200[ny_lo:ny_hi, nx_lo:nx_hi])
+        if count_activity < activity_min_count or count_neighbor <= neighbor_min_count:
             keep[i] = False
     return keep
 
@@ -239,12 +312,53 @@ def _sliding_window_filter(events, height, width, window_us, radius, min_count_s
     return _sliding_window_filter_python(events, height, width, window_us, radius, min_count_strict)
 
 
+def _activity_filter_numba_parallel(events, height, width, window_us, radius, min_count_strict):
+    """Run activity filter in parallel over time chunks (Numba releases GIL)."""
+    n = len(events)
+    t = np.ascontiguousarray(events["t"], dtype=np.int64)
+    x = np.ascontiguousarray(events["x"], dtype=np.uint16)
+    y = np.ascontiguousarray(events["y"], dtype=np.uint16)
+    t_min, t_max = int(t[0]), int(t[-1])
+    chunk_duration_us = max(window_us * 2, (t_max - t_min) // max(1, ACTIVITY_PARALLEL_CHUNKS))
+    n_chunks = max(1, (t_max - t_min + chunk_duration_us - 1) // chunk_duration_us)
+
+    def run_chunk(chunk_i):
+        c_start = t_min + chunk_i * chunk_duration_us
+        c_end = t_max + 1 if chunk_i == n_chunks - 1 else min(t_min + (chunk_i + 1) * chunk_duration_us, t_max + 1)
+        pad_start = np.searchsorted(t, c_start - window_us, side="left")
+        pad_end = np.searchsorted(t, c_end + window_us, side="right")
+        inner_start = np.searchsorted(t, c_start, side="left")
+        inner_end = np.searchsorted(t, c_end, side="left")
+        if inner_start >= inner_end:
+            return inner_start, inner_end, np.ones(0, dtype=np.bool_)
+        x_c = x[pad_start:pad_end]
+        y_c = y[pad_start:pad_end]
+        t_c = t[pad_start:pad_end]
+        keep_c = _sliding_window_filter_numba(x_c, y_c, t_c, height, width, window_us, radius, min_count_strict)
+        return inner_start, inner_end, keep_c[inner_start - pad_start : inner_end - pad_start]
+
+    keep = np.ones(n, dtype=bool)
+    with ThreadPoolExecutor(max_workers=min(ACTIVITY_PARALLEL_CHUNKS, n_chunks)) as ex:
+        futures = [ex.submit(run_chunk, i) for i in range(n_chunks)]
+        for f in as_completed(futures):
+            i_start, i_end, k = f.result()
+            keep[i_start:i_end] = k
+    return keep
+
+
 # Chunk duration for KDTree filter when scipy is used: smaller = faster per tree, more chunks (0.5s is a good balance).
 KDTREE_CHUNK_DURATION_US = 500_000  # 0.5 second
 # Use Numba sliding-window for both filters when available (single-pass O(n), much faster for large streams).
-# If False, activity/neighborhood use chunked KDTree when scipy is available.
 USE_NUMBA_FOR_ACTIVITY = True
 USE_NUMBA_FOR_NEIGHBORHOOD = True
+# Activity filter: run this many time-chunks in parallel (1 = single-threaded; 4–8 often faster for large streams).
+ACTIVITY_PARALLEL_CHUNKS = 8
+# Min events to use parallel activity filter; below this, single-threaded is faster.
+ACTIVITY_PARALLEL_MIN_EVENTS = 200_000
+# Combined (activity + neighborhood) filter: parallel time-chunks (e.g. 6 on Jetson Orin Nano).
+COMBINED_PARALLEL_CHUNKS = 6
+# Min events to use parallel combined filter.
+COMBINED_PARALLEL_MIN_EVENTS = 200_000
 
 
 def _kdtree_spatiotemporal_filter(events, window_us, spatial_radius, min_count, label=""):
@@ -295,6 +409,18 @@ def _kdtree_spatiotemporal_filter(events, window_us, spatial_radius, min_count, 
 def activity_filter(events, height, width):
     """Keep event only if there is at least one similar event in 500ms and 10x10 neighborhood."""
     if USE_NUMBA_FOR_ACTIVITY and _NUMBA_AVAILABLE:
+        n = len(events)
+        use_parallel = (
+            n >= ACTIVITY_PARALLEL_MIN_EVENTS
+            and ACTIVITY_PARALLEL_CHUNKS > 1
+        )
+        if use_parallel:
+            print("    Activity filter: using Numba (parallel sliding-window)")
+            return _activity_filter_numba_parallel(
+                events, height, width,
+                ACTIVITY_WINDOW_US, ACTIVITY_RADIUS,
+                ACTIVITY_MIN_COUNT - 1,
+            )
         print("    Activity filter: using Numba (sliding-window)")
         return _sliding_window_filter(
             events, height, width,
@@ -318,8 +444,79 @@ def activity_filter(events, height, width):
     )
 
 
+def _combined_filter_numba_parallel(events, height, width):
+    """Run combined activity+neighborhood filter in parallel over time chunks (Numba releases GIL)."""
+    n = len(events)
+    t = np.ascontiguousarray(events["t"], dtype=np.int64)
+    x = np.ascontiguousarray(events["x"], dtype=np.uint16)
+    y = np.ascontiguousarray(events["y"], dtype=np.uint16)
+    t_min, t_max = int(t[0]), int(t[-1])
+    chunk_duration_us = max(
+        ACTIVITY_WINDOW_US * 2,
+        (t_max - t_min) // max(1, COMBINED_PARALLEL_CHUNKS),
+    )
+    n_chunks = max(1, (t_max - t_min + chunk_duration_us - 1) // chunk_duration_us)
+
+    def run_chunk(chunk_i):
+        c_start = t_min + chunk_i * chunk_duration_us
+        c_end = (
+            t_max + 1
+            if chunk_i == n_chunks - 1
+            else min(t_min + (chunk_i + 1) * chunk_duration_us, t_max + 1)
+        )
+        pad_start = np.searchsorted(t, c_start - ACTIVITY_WINDOW_US, side="left")
+        pad_end = np.searchsorted(t, c_end + ACTIVITY_WINDOW_US, side="right")
+        inner_start = np.searchsorted(t, c_start, side="left")
+        inner_end = np.searchsorted(t, c_end, side="left")
+        if inner_start >= inner_end:
+            return inner_start, inner_end, np.ones(0, dtype=np.bool_)
+        x_c = x[pad_start:pad_end]
+        y_c = y[pad_start:pad_end]
+        t_c = t[pad_start:pad_end]
+        keep_c = _combined_activity_neighborhood_numba(
+            x_c, y_c, t_c, height, width,
+            ACTIVITY_WINDOW_US, ACTIVITY_RADIUS, ACTIVITY_MIN_COUNT,
+            NEIGHBOR_WINDOW_US, NEIGHBOR_RADIUS, NEIGHBOR_MIN_COUNT,
+        )
+        return inner_start, inner_end, keep_c[inner_start - pad_start : inner_end - pad_start]
+
+    keep = np.ones(n, dtype=bool)
+    with ThreadPoolExecutor(max_workers=min(COMBINED_PARALLEL_CHUNKS, n_chunks)) as ex:
+        futures = [ex.submit(run_chunk, i) for i in range(n_chunks)]
+        for f in as_completed(futures):
+            i_start, i_end, k = f.result()
+            keep[i_start:i_end] = k
+    return keep
+
+
+def combined_activity_neighborhood_filter(events, height, width):
+    """
+    Single pass: activity (500ms, 10x10, >=2) and neighborhood (200ms, 3x3, >3).
+    Keep event only if both pass. Returns keep mask or None if not using Numba.
+    Uses parallel time-chunks when COMBINED_PARALLEL_CHUNKS > 1 and event count >= COMBINED_PARALLEL_MIN_EVENTS.
+    """
+    if not _NUMBA_AVAILABLE:
+        return None
+    n = len(events)
+    if n == 0:
+        return np.ones(0, dtype=bool)
+    use_parallel = (
+        n >= COMBINED_PARALLEL_MIN_EVENTS and COMBINED_PARALLEL_CHUNKS > 1
+    )
+    if use_parallel:
+        return _combined_filter_numba_parallel(events, height, width)
+    x = np.ascontiguousarray(events["x"], dtype=np.uint16)
+    y = np.ascontiguousarray(events["y"], dtype=np.uint16)
+    t = np.ascontiguousarray(events["t"], dtype=np.int64)
+    return _combined_activity_neighborhood_numba(
+        x, y, t, height, width,
+        ACTIVITY_WINDOW_US, ACTIVITY_RADIUS, ACTIVITY_MIN_COUNT,
+        NEIGHBOR_WINDOW_US, NEIGHBOR_RADIUS, NEIGHBOR_MIN_COUNT,
+    )
+
+
 def neighborhood_filter(events, height, width):
-    """Keep event only if sum of events in 3x3 over 250ms is > 3."""
+    """Keep event only if sum of events in 3x3 over 200ms is > 3."""
     if USE_NUMBA_FOR_NEIGHBORHOOD and _NUMBA_AVAILABLE:
         print("    Neighborhood filter: using Numba (sliding-window)")
         return _sliding_window_filter(
@@ -377,8 +574,8 @@ def filter_and_save_raw(
     apply_activity=True, apply_neighborhood=True,
 ):
     """
-    Load events from RAW, remove hot pixels, apply activity filter (500ms 10x10),
-    then neighborhood filter (250ms 3x3), write filtered events to RAW.
+    Load events from RAW, remove hot pixels, apply activity (500ms 10x10) and
+    neighborhood (200ms 3x3, count > 3) in a single pass when both enabled and Numba available.
     Returns (width, height, stats) where stats is a dict with n_original, n_filtered, t_min_us, t_max_us.
     """
     print("  Loading events...")
@@ -389,6 +586,8 @@ def filter_and_save_raw(
     if n0 > 0:
         t_min_us = int(events["t"][0])
         t_max_us = int(events["t"][-1])
+    t_original_min_us = t_min_us
+    t_original_max_us = t_max_us
     if n0 == 0:
         writer = RAWEvt2EventFileWriter(
             width, height, output_raw_path,
@@ -398,7 +597,7 @@ def filter_and_save_raw(
         )
         writer.flush()
         writer.close()
-        return width, height, {"n_original": 0, "n_filtered": 0, "t_min_us": 0, "t_max_us": 0}
+        return width, height, {"n_original": 0, "n_filtered": 0, "t_min_us": 0, "t_max_us": 0, "t_original_min_us": 0, "t_original_max_us": 0}
     # Report which backends are available (Numba preferred; scipy = chunked KDTree)
     backends = []
     if _NUMBA_AVAILABLE:
@@ -408,17 +607,36 @@ def filter_and_save_raw(
     if not backends:
         backends.append("Python fallback")
     print("  Filter backends available:", ", ".join(backends))
-    if apply_activity:
+    print(f"  Events before filtering: {n0:,}")
+    if apply_activity and apply_neighborhood and _NUMBA_AVAILABLE:
+        parallel = n0 >= COMBINED_PARALLEL_MIN_EVENTS and COMBINED_PARALLEL_CHUNKS > 1
+        print(
+            "  Applying combined activity + neighborhood filter (single pass: 500ms 10x10 + 200ms 3x3"
+            + (" parallel)" if parallel else ")")
+            + "..."
+        )
+        keep = combined_activity_neighborhood_filter(events, height, width)
+        if keep is not None:
+            events = events[keep]
+            print(f"    After combined filter: {len(events)} events (was {n0})")
+        else:
+            keep = activity_filter(events, height, width)
+            events = events[keep]
+            n1 = len(events)
+            if n1 > 0:
+                keep = neighborhood_filter(events, height, width)
+                events = events[keep]
+            print(f"    After activity + neighborhood (two passes): {len(events)} events (was {n0})")
+    elif apply_activity:
         print("  Applying activity filter (500ms, 10x10)...")
         keep = activity_filter(events, height, width)
         events = events[keep]
         print(f"    After activity filter: {len(events)} events (was {n0})")
-    n1 = len(events)
-    if apply_neighborhood and len(events) > 0:
-        print("  Applying neighborhood filter (250ms, 3x3, count > 3)...")
+    elif apply_neighborhood and len(events) > 0:
+        print("  Applying neighborhood filter (200ms, 3x3, count > 3)...")
         keep = neighborhood_filter(events, height, width)
         events = events[keep]
-        print(f"    After neighborhood filter: {len(events)} events (was {n1})")
+        print(f"    After neighborhood filter: {len(events)} events (was {n0})")
     n_filtered = len(events)
     if n_filtered > 0:
         t_min_us = int(events["t"][0])
@@ -438,7 +656,14 @@ def filter_and_save_raw(
         writer.add_cd_events(buf)
     writer.flush()
     writer.close()
-    return width, height, {"n_original": n0, "n_filtered": n_filtered, "t_min_us": t_min_us, "t_max_us": t_max_us}
+    return width, height, {
+        "n_original": n0,
+        "n_filtered": n_filtered,
+        "t_min_us": t_min_us,
+        "t_max_us": t_max_us,
+        "t_original_min_us": t_original_min_us,
+        "t_original_max_us": t_original_max_us,
+    }
 
 
 # HDF5 event dtype: x, y, p, t (matches Metavision / ECF EventCD)
@@ -551,10 +776,12 @@ def iter_events_from_hdf5(hdf5_path, delta_t_us=DELTA_T_US):
         ts += delta_t_us
 
 
-def events_to_mp4(event_file_path, mp4_path, width, height):
+def events_to_mp4(event_file_path, mp4_path, width, height, t_start_us=None, t_end_us=None):
     """Render event file (RAW or HDF5 with t,x,y,p) to MP4 using periodic frame generation.
     Streams frames to disk as they are generated (when using OpenCV) to save memory and time.
     ON (polarity 1) = white, OFF (polarity 0) = blue.
+    If t_start_us and t_end_us are provided, generates frames for the full time range so video
+    duration matches the recording (empty slices yield blank frames).
     """
     frame_gen = PeriodicFrameGenerationAlgorithm(
         sensor_width=width,
@@ -590,13 +817,40 @@ def events_to_mp4(event_file_path, mp4_path, width, height):
     frame_gen.set_output_callback(on_frame)
 
     try:
-        try:
-            mv_iterator = EventsIterator(input_path=event_file_path, delta_t=DELTA_T_US)
-            for evs in mv_iterator:
+        if t_start_us is not None and t_end_us is not None:
+            # Full-duration mode: load events, then drive time from t_start_us to t_end_us
+            # so video length matches recording length (empty slices -> blank frames).
+            try:
+                mv_iterator = EventsIterator(input_path=event_file_path, delta_t=DELTA_T_US)
+                chunks = []
+                for evs in mv_iterator:
+                    if evs.size > 0:
+                        chunks.append(evs.copy())
+            except Exception:
+                chunks = []
+                for ev_slice, _ in iter_events_from_hdf5(event_file_path, delta_t_us=DELTA_T_US):
+                    if ev_slice.size > 0:
+                        chunks.append(ev_slice.copy())
+            if not chunks:
+                raise RuntimeError("No events in event file")
+            events_all = np.concatenate(chunks)
+            events_all = np.sort(events_all, order="t")
+            t_arr = events_all["t"]
+            ts = int(t_start_us)
+            while ts < t_end_us:
+                end_ts = min(ts + DELTA_T_US, t_end_us)
+                mask = (t_arr >= ts) & (t_arr < end_ts)
+                evs = events_all[mask]
                 frame_gen.process_events(evs)
-        except Exception:
-            for ev_slice, _ in iter_events_from_hdf5(event_file_path, delta_t_us=DELTA_T_US):
-                frame_gen.process_events(ev_slice)
+                ts = end_ts
+        else:
+            try:
+                mv_iterator = EventsIterator(input_path=event_file_path, delta_t=DELTA_T_US)
+                for evs in mv_iterator:
+                    frame_gen.process_events(evs)
+            except Exception:
+                for ev_slice, _ in iter_events_from_hdf5(event_file_path, delta_t_us=DELTA_T_US):
+                    frame_gen.process_events(ev_slice)
 
         if frame_count[0] == 0:
             raise RuntimeError("No frames generated from event file")
@@ -649,6 +903,54 @@ def main():
     args = parse_args()
     output_dir = os.path.abspath(args.output_dir)
     os.makedirs(output_dir, exist_ok=True)
+
+    if args.input:
+        # Filter-only mode: use existing RAW file (e.g. recorded with metavision_file_recorder)
+        raw_path = os.path.abspath(args.input)
+        if not os.path.isfile(raw_path):
+            raise FileNotFoundError(f"Input file not found: {raw_path}")
+        base = os.path.splitext(os.path.basename(raw_path))[0]
+        filtered_raw_path = os.path.join(output_dir, f"{base}_filtered.raw")
+        mp4_path = os.path.join(output_dir, f"{base}_filtered.mp4")
+        mv_it = EventsIterator(input_path=raw_path, delta_t=DELTA_T_US)
+        height, width = mv_it.get_size()
+        del mv_it
+        hot_pixels = set()
+        original_size_bytes = os.path.getsize(raw_path)
+        print(f"Filtering (activity + neighborhood) and writing to RAW: {raw_path}")
+        width, height, stats = filter_and_save_raw(
+            raw_path, filtered_raw_path, hot_pixels, width, height,
+            apply_activity=True, apply_neighborhood=False,
+        )
+        n_orig, n_filt = stats["n_original"], stats["n_filtered"]
+        t_min, t_max = stats["t_min_us"], stats["t_max_us"]
+        duration_s = (t_max - t_min) / 1e6 if n_filt > 0 and t_max > t_min else 0.0
+        ev_per_sec = n_filt / duration_s if duration_s > 0 else 0.0
+        filtered_size_bytes = os.path.getsize(filtered_raw_path)
+        if n_orig > 0:
+            pct_events_removed = 100.0 * (n_orig - n_filt) / n_orig
+            print(f"  Filtering removed {pct_events_removed:.1f}% of events ({n_orig - n_filt:,} of {n_orig:,}).")
+        if original_size_bytes > 0:
+            pct_size_removed = 100.0 * (1.0 - filtered_size_bytes / original_size_bytes)
+            print(f"  Output file is {100 - pct_size_removed:.1f}% of original size ({pct_size_removed:.1f}% size reduction).")
+        print(f"  Filtered: {n_filt:,} events, {duration_s:.2f} s, {ev_per_sec:,.0f} ev/s")
+        print("Filtered RAW saved to", filtered_raw_path)
+        if n_filt == 0:
+            print("No events after filtering; skipping MP4.")
+        else:
+            print("Rendering event stream to MP4 (full recording duration)...")
+            t_orig_min = stats.get("t_original_min_us")
+            t_orig_max = stats.get("t_original_max_us")
+            events_to_mp4(
+                filtered_raw_path, mp4_path, width, height,
+                t_start_us=t_orig_min, t_end_us=t_orig_max,
+            )
+            print("MP4 saved to", mp4_path)
+            print("Displaying MP4...")
+            display_mp4(mp4_path)
+        print("Done.")
+        return
+
     ts_str = time.strftime("%y%m%d_%H%M%S", time.localtime())
     raw_path = os.path.join(output_dir, f"recording_{ts_str}.raw")
     filtered_raw_path = os.path.join(output_dir, f"recording_{ts_str}_filtered.raw")
@@ -656,6 +958,7 @@ def main():
 
     # 1) Open camera and run short calibration to identify hot pixels
     print("Opening camera...")
+    print("  (If you see 'EVK camera isn't connected in USB3', use a USB3 port. Duplicate OpenCV libs can cause segfaults.)")
     device = initiate_device("")
     calib_raw_path = os.path.join(output_dir, f"calib_{ts_str}.raw")
     print(f"Calibration: recording {CALIBRATION_DURATION_S} s to identify hot pixels...")
@@ -666,20 +969,30 @@ def main():
     hot_pixels, w2, h2 = find_hot_pixels(calib_raw_path, top_k=HOT_PIXEL_TOP_K)
     width, height = w2, h2
     print("Hot pixels (x,y):", sorted(hot_pixels))
-    # Mask hot pixels at hardware so they are not output during the main recording
-    mask_applied = apply_hot_pixel_mask(device, hot_pixels)
+    # Mask hot pixels at hardware so they are not output during the main recording (skip if SKIP_HARDWARE_HOT_PIXEL_MASK: some drivers segfault)
+    mask_applied = False
+    if not SKIP_HARDWARE_HOT_PIXEL_MASK:
+        mask_applied = apply_hot_pixel_mask(device, hot_pixels)
     if mask_applied:
         print("Hot pixels masked at hardware; they will be excluded from the main recording.")
     else:
-        print("Hardware mask not available on this device; hot pixels will be removed in software after recording.")
-        print("  (Prophesee: run 'metavision_active_pixel_detection' to detect and save calibration;")
-        print("   for GenX320 use default calib path; for Gen4.1/IMX636 use Digital Event Mask in camera settings.)")
+        if SKIP_HARDWARE_HOT_PIXEL_MASK:
+            print("Hardware mask disabled (SKIP_HARDWARE_HOT_PIXEL_MASK); hot pixels will be removed in software after recording.")
+        else:
+            print("Hardware mask not available on this device; hot pixels will be removed in software after recording.")
+            print("  (Prophesee: run 'metavision_active_pixel_detection' to detect and save calibration;")
+            print("   for GenX320 use default calib path; for Gen4.1/IMX636 use Digital Event Mask in camera settings.)")
     try:
         os.remove(calib_raw_path)
     except OSError:
         pass
 
-    # 2) Record 10 seconds (with hot pixels already masked if supported)
+    # Reopen device for main recording (avoids segfault on some setups when reusing after calibration)
+    del device
+    print("Reopening camera for main recording...")
+    device = initiate_device("")
+
+    # 2) Record 10 seconds (iterator drives stream so data is written)
     print(f"Recording main sequence for {RECORD_DURATION_S} seconds...")
     width, height = record_seconds(device, raw_path, duration_s=RECORD_DURATION_S)
     if not os.path.isfile(raw_path):
@@ -692,7 +1005,7 @@ def main():
     # 3) Apply activity and neighborhood filters; only apply software hot-pixel removal if mask was not applied
     hot_pixels_for_load = None if mask_applied else hot_pixels
     original_size_bytes = os.path.getsize(raw_path)
-    print("Filtering (activity only) and writing to RAW...")
+    print("Filtering (activity + neighborhood) and writing to RAW...")
     width, height, stats = filter_and_save_raw(
         raw_path, filtered_raw_path, hot_pixels_for_load, width, height,
         apply_activity=True, apply_neighborhood=False,
@@ -722,14 +1035,21 @@ def main():
     os.remove(raw_path)
     print("Deleted original raw recording.")
 
-    # 4) Render filtered events to MP4
-    print("Rendering event stream to MP4...")
-    events_to_mp4(filtered_raw_path, mp4_path, width, height)
-    print("MP4 saved to", mp4_path)
-
-    # 5) Display MP4
-    print("Displaying MP4...")
-    display_mp4(mp4_path)
+    # 4) Render filtered events to MP4 (skip if no events)
+    if n_filt == 0:
+        print("No events after filtering; skipping MP4 render and display.")
+        print("If recording produced an empty file, record a RAW file with the Metavision app or metavision_file_recorder, then run: python record_filter_display.py -i <file.raw>")
+    else:
+        print("Rendering event stream to MP4 (full recording duration)...")
+        t_orig_min = stats.get("t_original_min_us")
+        t_orig_max = stats.get("t_original_max_us")
+        events_to_mp4(
+            filtered_raw_path, mp4_path, width, height,
+            t_start_us=t_orig_min, t_end_us=t_orig_max,
+        )
+        print("MP4 saved to", mp4_path)
+        print("Displaying MP4...")
+        display_mp4(mp4_path)
 
     print("Done.")
 
