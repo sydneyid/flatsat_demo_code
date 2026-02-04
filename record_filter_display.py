@@ -6,7 +6,7 @@ already excluded. Apply activity (500 ms, 10x10) and neighborhood (250 ms, 3x3)
 filters, write to RAW, render to MP4, and display.
 
 Requires: Metavision SDK Python (metavision_core, metavision_sdk_core).
-Optional: numba for faster filtering; opencv-python for MP4. No live preview.
+Optional: scipy for fast cKDTree-based activity/neighborhood filters; numba as fallback; opencv-python for MP4. No live preview.
 """
 
 import argparse
@@ -15,6 +15,12 @@ import sys
 import time
 
 import numpy as np
+
+try:
+    from scipy.spatial import cKDTree
+    _SCIPY_AVAILABLE = True
+except ImportError:
+    _SCIPY_AVAILABLE = False
 
 try:
     from numba import njit
@@ -87,27 +93,42 @@ def record_seconds(device, output_raw_path, duration_s=RECORD_DURATION_S):
 
 def apply_hot_pixel_mask(device, hot_pixels):
     """
-    Try to mask hot pixels at the hardware level so they are not output during recording.
-    Uses I_DigitalEventMask (Gen4.1, IMX636, GenX320) or I_RoiPixelMask (GenX320).
-    Returns True if the mask was applied, False if the facility is not available (fall back to software filtering).
+    Try to mask hot pixels at the hardware level (Prophesee approach).
+    - I_DigitalEventMask (Gen4.1, IMX636, GenX320): get_pixel_masks() then masks[i].set_mask(x, y, True).
+    - I_RoiPixelMask (GenX320): set_pixel(x, y, False) then apply_pixels().
+    Returns True if the mask was applied, False otherwise (fall back to software filtering).
+    See: https://docs.prophesee.ai/stable/hw/manuals/pixel_selection/digital_event_mask.html
     """
     if not hot_pixels:
         return True
-    # Try I_DigitalEventMask first (Gen4.1, IMX636, GenX320): enabled=True means pixel is masked
+    hot_list = list(hot_pixels)[:64]  # many sensors limit to 64 mask entries
+    # Prophesee I_DigitalEventMask: get_pixel_masks() returns list of I_PixelMask; each has set_mask(x, y, enabled)
     try:
         dem = device.get_i_digital_event_mask()
         if dem is not None:
-            for (x, y) in hot_pixels:
-                dem.set_pixel(x, y, True)  # True = add to mask (pixel disabled)
+            masks = dem.get_pixel_masks()
+            if masks and len(masks) > 0:
+                for i, (x, y) in enumerate(hot_list):
+                    if i < len(masks):
+                        masks[i].set_mask(int(x), int(y), True)  # True = pixel masked (disabled)
+                return True
+    except (AttributeError, TypeError, IndexError):
+        pass
+    # Alternative: some bindings expose set_pixel on the DEM directly
+    try:
+        dem = device.get_i_digital_event_mask()
+        if dem is not None and hasattr(dem, "set_pixel"):
+            for (x, y) in hot_list:
+                dem.set_pixel(int(x), int(y), True)
             return True
     except (AttributeError, TypeError):
         pass
-    # Try I_RoiPixelMask (GenX320 only)
+    # I_RoiPixelMask (GenX320 only)
     try:
         roi_px = device.get_i_roi_pixel_mask()
         if roi_px is not None:
-            for (x, y) in hot_pixels:
-                roi_px.set_pixel(x, y, False)
+            for (x, y) in hot_list:
+                roi_px.set_pixel(int(x), int(y), False)  # False = pixel disabled
             roi_px.apply_pixels()
             return True
     except (AttributeError, TypeError):
@@ -218,17 +239,62 @@ def _sliding_window_filter(events, height, width, window_us, radius, min_count_s
     return _sliding_window_filter_python(events, height, width, window_us, radius, min_count_strict)
 
 
+def _kdtree_spatiotemporal_filter(events, window_us, spatial_radius, min_count, label=""):
+    """
+    Filter events using a 3D KDTree in (x, y, t_scaled) with Chebyshev distance.
+    Keep event i iff the number of events in the box (2*spatial_radius in x,y and window_us in t) is >= min_count.
+    """
+    n = len(events)
+    if n == 0:
+        return np.ones(0, dtype=bool)
+    x = np.ascontiguousarray(events["x"], dtype=np.float64)
+    y = np.ascontiguousarray(events["y"], dtype=np.float64)
+    t = np.ascontiguousarray(events["t"], dtype=np.int64)
+    # Scale time so that ±window_us in t maps to ±spatial_radius in t_scaled (Chebyshev)
+    t_scale = spatial_radius / float(window_us) if window_us else 1.0
+    t_scaled = t * t_scale
+    points = np.column_stack((x, y, t_scaled))
+    if label:
+        print(f"    Building KDTree ({label})...")
+    tree = cKDTree(points)
+    radius = spatial_radius
+    if label:
+        print(f"    Querying neighbors ({label})...")
+    neighbor_counts = tree.query_ball_point(points, r=radius, p=np.inf, return_length=True)
+    keep_mask = neighbor_counts >= min_count
+    return keep_mask
+
+
 def activity_filter(events, height, width):
-    """Keep event only if there is at least one similar event in 500ms and 10x10 neighborhood."""
+    """Keep event only if there is at least one similar event in 500ms and 10x10 neighborhood (cKDTree)."""
+    if _SCIPY_AVAILABLE:
+        keep = _kdtree_spatiotemporal_filter(
+            events,
+            window_us=ACTIVITY_WINDOW_US,
+            spatial_radius=ACTIVITY_RADIUS,
+            min_count=ACTIVITY_MIN_COUNT,
+            label="activity",
+        )
+        return keep
     return _sliding_window_filter(
         events, height, width,
         ACTIVITY_WINDOW_US, ACTIVITY_RADIUS,
         ACTIVITY_MIN_COUNT - 1,
-    )  # keep if count > 1, i.e. >= 2
+    )
 
 
 def neighborhood_filter(events, height, width):
-    """Keep event only if sum of events in 3x3 over 250ms is > 3."""
+    """Keep event only if sum of events in 3x3 over 250ms is > 3 (cKDTree)."""
+    if _SCIPY_AVAILABLE:
+        # keep iff count > NEIGHBOR_MIN_COUNT (i.e. at least NEIGHBOR_MIN_COUNT + 1 events)
+        keep = _kdtree_spatiotemporal_filter(
+            events,
+            window_us=NEIGHBOR_WINDOW_US,
+            spatial_radius=NEIGHBOR_RADIUS,
+            min_count=NEIGHBOR_MIN_COUNT + 1,
+            label="neighborhood",
+        )
+        return keep
     return _sliding_window_filter(
         events, height, width,
         NEIGHBOR_WINDOW_US, NEIGHBOR_RADIUS,
@@ -544,7 +610,9 @@ def main():
     if mask_applied:
         print("Hot pixels masked at hardware; they will be excluded from the main recording.")
     else:
-        print("Hardware mask not available; hot pixels will be removed in software after recording.")
+        print("Hardware mask not available on this device; hot pixels will be removed in software after recording.")
+        print("  (Prophesee: run 'metavision_active_pixel_detection' to detect and save calibration;")
+        print("   for GenX320 use default calib path; for Gen4.1/IMX636 use Digital Event Mask in camera settings.)")
     try:
         os.remove(calib_raw_path)
     except OSError:
