@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Record 20 seconds from a Metavision event camera, apply filters (hot pixels,
-activity filter 500ms/10x10, neighborhood filter 250ms/3x3), write filtered
-events to RAW, render to MP4, and display the video.
+Record from a Metavision event camera: run a short calibration (0.1 s) to identify
+hot pixels, mask them at hardware (if supported), then record 20 s with hot pixels
+already excluded. Apply activity (500 ms, 10x10) and neighborhood (250 ms, 3x3)
+filters, write to RAW, render to MP4, and display.
 
 Requires: Metavision SDK Python (metavision_core, metavision_sdk_core).
-Optional: numba (pip install numba) for much faster filtering; opencv-python for MP4.
-Recording has no live preview.
+Optional: numba for faster filtering; opencv-python for MP4. No live preview.
 """
 
 import argparse
@@ -41,6 +41,7 @@ except ImportError:
     HAS_CV2 = False
 
 RECORD_DURATION_S = 20
+CALIBRATION_DURATION_S = 0.1  # Short recording to identify hot pixels before main recording
 HOT_PIXEL_TOP_K = 10
 FRAME_FPS = 25
 DELTA_T_US = 10000  # 10 ms slices for iteration
@@ -70,7 +71,7 @@ def parse_args():
 
 
 def record_seconds(device, output_raw_path, duration_s=RECORD_DURATION_S):
-    """Record from device for duration_s seconds to a RAW file (no live preview)."""
+    """Record from device for duration_s seconds to a RAW file (no live preview). Returns (width, height)."""
     if device.get_i_events_stream():
         device.get_i_events_stream().log_raw_data(output_raw_path)
     mv_iterator = EventsIterator.from_device(device=device, delta_t=DELTA_T_US)
@@ -82,6 +83,36 @@ def record_seconds(device, output_raw_path, duration_s=RECORD_DURATION_S):
     if device.get_i_events_stream():
         device.get_i_events_stream().stop_log_raw_data()
     return width, height
+
+
+def apply_hot_pixel_mask(device, hot_pixels):
+    """
+    Try to mask hot pixels at the hardware level so they are not output during recording.
+    Uses I_DigitalEventMask (Gen4.1, IMX636, GenX320) or I_RoiPixelMask (GenX320).
+    Returns True if the mask was applied, False if the facility is not available (fall back to software filtering).
+    """
+    if not hot_pixels:
+        return True
+    # Try I_DigitalEventMask first (Gen4.1, IMX636, GenX320): enabled=True means pixel is masked
+    try:
+        dem = device.get_i_digital_event_mask()
+        if dem is not None:
+            for (x, y) in hot_pixels:
+                dem.set_pixel(x, y, True)  # True = add to mask (pixel disabled)
+            return True
+    except (AttributeError, TypeError):
+        pass
+    # Try I_RoiPixelMask (GenX320 only)
+    try:
+        roi_px = device.get_i_roi_pixel_mask()
+        if roi_px is not None:
+            for (x, y) in hot_pixels:
+                roi_px.set_pixel(x, y, False)
+            roi_px.apply_pixels()
+            return True
+    except (AttributeError, TypeError):
+        pass
+    return False
 
 
 def find_hot_pixels(raw_path, top_k=HOT_PIXEL_TOP_K):
@@ -496,10 +527,32 @@ def main():
     filtered_raw_path = os.path.join(output_dir, f"recording_{ts_str}_filtered.raw")
     mp4_path = os.path.join(output_dir, f"recording_{ts_str}_filtered.mp4")
 
-    # 1) Record 20 seconds from camera (no live preview)
-    print("Opening camera and recording for 20 seconds...")
+    # 1) Open camera and run short calibration to identify hot pixels
+    print("Opening camera...")
     device = initiate_device("")
-    width, height = record_seconds(device, raw_path)
+    calib_raw_path = os.path.join(output_dir, f"calib_{ts_str}.raw")
+    print(f"Calibration: recording {CALIBRATION_DURATION_S} s to identify hot pixels...")
+    width, height = record_seconds(device, calib_raw_path, duration_s=CALIBRATION_DURATION_S)
+    if not os.path.isfile(calib_raw_path):
+        raise FileNotFoundError("Calibration recording did not produce a file.")
+    print("Identifying top 10 hot pixels from calibration...")
+    hot_pixels, w2, h2 = find_hot_pixels(calib_raw_path, top_k=HOT_PIXEL_TOP_K)
+    width, height = w2, h2
+    print("Hot pixels (x,y):", sorted(hot_pixels))
+    # Mask hot pixels at hardware so they are not output during the main recording
+    mask_applied = apply_hot_pixel_mask(device, hot_pixels)
+    if mask_applied:
+        print("Hot pixels masked at hardware; they will be excluded from the main recording.")
+    else:
+        print("Hardware mask not available; hot pixels will be removed in software after recording.")
+    try:
+        os.remove(calib_raw_path)
+    except OSError:
+        pass
+
+    # 2) Record 20 seconds (with hot pixels already masked if supported)
+    print(f"Recording main sequence for {RECORD_DURATION_S} seconds...")
+    width, height = record_seconds(device, raw_path, duration_s=RECORD_DURATION_S)
     if not os.path.isfile(raw_path):
         raise FileNotFoundError(
             f"Recording did not produce a file at {raw_path}. "
@@ -507,17 +560,12 @@ def main():
         )
     print("Recording saved to", raw_path)
 
-    # 2) Find top 10 most active (hot) pixels
-    print("Analyzing event counts to find top 10 hot pixels...")
-    hot_pixels, w2, h2 = find_hot_pixels(raw_path, top_k=HOT_PIXEL_TOP_K)
-    width, height = w2, h2
-    print("Hot pixels (x,y):", sorted(hot_pixels))
-
-    # 3) Apply activity filter (500ms, 10x10) and neighborhood filter (250ms, 3x3), write to RAW
+    # 3) Apply activity and neighborhood filters; only apply software hot-pixel removal if mask was not applied
+    hot_pixels_for_load = None if mask_applied else hot_pixels
     original_size_bytes = os.path.getsize(raw_path)
     print("Filtering (activity + neighborhood) and writing to RAW...")
     width, height, stats = filter_and_save_raw(
-        raw_path, filtered_raw_path, hot_pixels, width, height,
+        raw_path, filtered_raw_path, hot_pixels_for_load, width, height,
         apply_activity=True, apply_neighborhood=True,
     )
     filtered_size_bytes = os.path.getsize(filtered_raw_path)
@@ -545,7 +593,7 @@ def main():
     os.remove(raw_path)
     print("Deleted original raw recording.")
 
-    # 4) Render filtered events (from RAW) to MP4
+    # 4) Render filtered events to MP4
     print("Rendering event stream to MP4...")
     events_to_mp4(filtered_raw_path, mp4_path, width, height)
     print("MP4 saved to", mp4_path)
