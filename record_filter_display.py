@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
 """
 Record from a Metavision event camera: run a short calibration (0.1 s) to identify
-hot pixels, mask them at hardware (if supported), then record 10 s with hot pixels
-already excluded. Apply activity (500 ms, 10x10) and neighborhood (250 ms, 3x3)
-filters, write to RAW, render to MP4, and display.
+hot pixels, mask them at hardware (if supported), then record 11 s with hot pixels
+already excluded. The first TRIM_FIRST_S seconds of events are dropped; then
+activity filter only (neighborhood and flicker off), write to RAW,
+render to MP4, and display.
 
 Requires: Metavision SDK Python (metavision_core, metavision_sdk_core).
-Optional: scipy for fast cKDTree-based activity/neighborhood filters; numba as fallback; opencv-python for MP4. No live preview.
+Optional: scipy for cKDTree fallback; numba for fast filters; opencv-python for MP4.
+
+Filter tuning (constants at top of file):
+  Activity (cluster density): ACTIVITY_WINDOW_US, ACTIVITY_RADIUS, ACTIVITY_MIN_COUNT.
+  Micro-activity (tight clusters): MICRO_ACTIVITY_WINDOW_US (5ms), 3x3; require >=2 events.
+  Neighborhood: NEIGHBOR_MIN_COUNT, NEIGHBOR_WINDOW_US (200ms 3x3).
+  Flicker: FLICKER_MIN_BROAD_COUNT, FLICKER_TINY_WINDOW_US (isolated ON-OFF pairs).
+  Refractory: REFRACTORY_US (same-pixel dead time, removes burst noise).
 """
 
 import argparse
@@ -47,7 +55,8 @@ try:
 except ImportError:
     HAS_CV2 = False
 
-RECORD_DURATION_S = 10
+RECORD_DURATION_S = 11
+TRIM_FIRST_S = 1  # Cut the first N seconds of events after loading (0 = no trim)
 CALIBRATION_DURATION_S = 0.1  # Short recording to identify hot pixels before main recording
 HOT_PIXEL_TOP_K = 10
 # Set False to mask hot pixels in hardware before main recording (applied after device reopen). Set True to skip and remove in software only.
@@ -55,20 +64,40 @@ SKIP_HARDWARE_HOT_PIXEL_MASK = False
 FRAME_FPS = 25
 DELTA_T_US = 10000  # 10 ms slices for iteration
 
-# Activity filter: 500ms window, 10x10 neighborhood; drop if no similar events in that window
-ACTIVITY_WINDOW_US = 500_000  # 500 ms
-ACTIVITY_RADIUS = 5  # 10x10 = radius 5 on each side
-ACTIVITY_MIN_COUNT = 2  # keep event only if at least this many in window (incl. self)
+# Activity filter: time window and spatial neighborhood; drop if too few similar events
+ACTIVITY_WINDOW_US = 50_000  # 50 ms (shorter = stricter)
+ACTIVITY_RADIUS = 3  # 7x7 neighborhood (radius 3 each side)
+ACTIVITY_MIN_COUNT = 22  # keep only if at least this many in window (incl. self); raise to remove more
 
-# Neighborhood filter: 200ms window, 3x3 kernel; remove if not > NEIGHBOR_MIN_COUNT events in 3x3 over 200ms
+# Neighborhood filter: removes low-activity pixels. Tuning for noise:
+#   NEIGHBOR_MIN_COUNT=3 (keep if >3, i.e. >=4 in 3x3) removes isolated ON-OFF pairs.
+#   Shorter NEIGHBOR_WINDOW_US (e.g. 100_000) = stricter in time; larger NEIGHBOR_RADIUS = wider kernel.
 NEIGHBOR_WINDOW_US = 200_000  # 200 ms
 NEIGHBOR_RADIUS = 1  # 3x3
-NEIGHBOR_MIN_COUNT = 2  # keep if count > 2 (i.e. >= 3 in 3x3); use 3 for stricter (>= 4 events)
+NEIGHBOR_MIN_COUNT = 1  # keep if count > 1 (>= 2 in 3x3); use 0 for gentler, 2+ for stricter
+
+# Flicker / isolated-pair filter: remove ON-OFF pairs that have no other nearby activity.
+# An event is removed if in a tiny window (FLICKER_TINY_WINDOW_US, 3x3) it forms a pair (1 ON, 1 OFF)
+# and in a broader window (FLICKER_BROAD_WINDOW_US, 10x10) there are fewer than FLICKER_MIN_BROAD_COUNT events.
+FLICKER_TINY_WINDOW_US = 5_000  # 5 ms: pair can be this far apart in time (wider = catch more pairs)
+FLICKER_TINY_RADIUS = 1  # 3x3
+FLICKER_BROAD_WINDOW_US = 50_000  # 50 ms
+FLICKER_BROAD_RADIUS = 5  # 10x10
+FLICKER_MIN_BROAD_COUNT = 6  # keep only if broad count >= this; higher = more aggressive (remove more flicker)
+
+# Micro-activity filter: require very close neighbors in time (true clusters have events within ms).
+# Keeps event only if >= MICRO_ACTIVITY_MIN_COUNT events in MICRO_ACTIVITY_WINDOW_US and 3x3.
+MICRO_ACTIVITY_WINDOW_US = 5_000  # 5 ms
+MICRO_ACTIVITY_RADIUS = 1  # 3x3
+MICRO_ACTIVITY_MIN_COUNT = 2  # keep if at least this many in 5ms 3x3 (incl. self); raise for stricter
+
+# Refractory filter: suppress repeated events at the same pixel within a dead time (removes burst noise).
+REFRACTORY_US = 50  # min time between events at same pixel (us); 0 = off, 50–200 typical
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Record 10s (or use --input RAW), apply activity filter, save filtered RAW and show MP4.",
+        description="Record 11s (or use --input RAW), apply activity filter, save filtered RAW and show MP4.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -299,6 +328,140 @@ def _combined_activity_neighborhood_numba(
     return keep
 
 
+@njit(cache=True)
+def _flicker_filter_numba(
+    x, y, t, p, height, width,
+    tiny_window_us, tiny_radius,
+    broad_window_us, broad_radius,
+    min_broad_count,
+):
+    """
+    Remove isolated ON-OFF pairs: if in a tiny spatiotemporal window there is exactly
+    1 ON and 1 OFF (and no other events), and in a broader window the total count
+    is < min_broad_count, mark as noise (flicker).
+    """
+    n = x.size
+    keep = np.ones(n, dtype=np.bool_)
+    tiny_on = np.zeros((height, width), dtype=np.int32)
+    tiny_off = np.zeros((height, width), dtype=np.int32)
+    broad = np.zeros((height, width), dtype=np.int32)
+    left_tiny = 0
+    left_broad = 0
+    right = 0
+    for i in range(n):
+        t_i = t[i]
+        while right < n and t[right] <= t_i + broad_window_us:
+            xr, yr = x[right], y[right]
+            pr = 1 if p[right] > 0 else 0
+            if 0 <= xr < width and 0 <= yr < height:
+                broad[yr, xr] += 1
+                if t[right] <= t_i + tiny_window_us:
+                    if pr:
+                        tiny_on[yr, xr] += 1
+                    else:
+                        tiny_off[yr, xr] += 1
+            right += 1
+        while left_broad < n and t[left_broad] < t_i - broad_window_us:
+            xl, yl = x[left_broad], y[left_broad]
+            pl = 1 if p[left_broad] > 0 else 0
+            if 0 <= xl < width and 0 <= yl < height:
+                broad[yl, xl] -= 1
+                if t[left_broad] >= t_i - tiny_window_us:
+                    if pl:
+                        tiny_on[yl, xl] -= 1
+                    else:
+                        tiny_off[yl, xl] -= 1
+            left_broad += 1
+        while left_tiny < n and t[left_tiny] < t_i - tiny_window_us:
+            xl, yl = x[left_tiny], y[left_tiny]
+            pl = 1 if p[left_tiny] > 0 else 0
+            if 0 <= xl < width and 0 <= yl < height:
+                if pl:
+                    tiny_on[yl, xl] -= 1
+                else:
+                    tiny_off[yl, xl] -= 1
+            left_tiny += 1
+        xi, yi = x[i], y[i]
+        ty_lo = max(0, yi - tiny_radius)
+        ty_hi = min(height, yi + tiny_radius + 1)
+        tx_lo = max(0, xi - tiny_radius)
+        tx_hi = min(width, xi + tiny_radius + 1)
+        n_on = np.sum(tiny_on[ty_lo:ty_hi, tx_lo:tx_hi])
+        n_off = np.sum(tiny_off[ty_lo:ty_hi, tx_lo:tx_hi])
+        by_lo = max(0, yi - broad_radius)
+        by_hi = min(height, yi + broad_radius + 1)
+        bx_lo = max(0, xi - broad_radius)
+        bx_hi = min(width, xi + broad_radius + 1)
+        broad_count = np.sum(broad[by_lo:by_hi, bx_lo:bx_hi])
+        if n_on == 1 and n_off == 1 and broad_count < min_broad_count:
+            keep[i] = False
+    return keep
+
+
+def flicker_filter(events, height, width):
+    """Remove isolated ON-OFF (flicker) pairs that have no other nearby activity."""
+    if not _NUMBA_AVAILABLE:
+        return np.ones(len(events), dtype=bool)
+    n = len(events)
+    if n == 0:
+        return np.ones(0, dtype=bool)
+    x = np.ascontiguousarray(events["x"], dtype=np.uint16)
+    y = np.ascontiguousarray(events["y"], dtype=np.uint16)
+    t = np.ascontiguousarray(events["t"], dtype=np.int64)
+    p = np.ascontiguousarray(events["p"], dtype=np.int8)
+    return _flicker_filter_numba(
+        x, y, t, p, height, width,
+        FLICKER_TINY_WINDOW_US, FLICKER_TINY_RADIUS,
+        FLICKER_BROAD_WINDOW_US, FLICKER_BROAD_RADIUS,
+        FLICKER_MIN_BROAD_COUNT,
+    )
+
+
+@njit(cache=True)
+def _refractory_filter_numba(x, y, t, height, width, refractory_us):
+    """Keep only the first event at each pixel in each refractory window (suppress burst noise)."""
+    n = x.size
+    keep = np.ones(n, dtype=np.bool_)
+    if refractory_us <= 0:
+        return keep
+    last_t = np.full((height, width), -1, dtype=np.int64)  # -1 = no previous event
+    for i in range(n):
+        xi, yi = x[i], y[i]
+        if xi >= width or yi >= height:
+            continue
+        ti = t[i]
+        prev = last_t[yi, xi]
+        if prev >= 0 and (ti - prev) < refractory_us:
+            keep[i] = False
+        else:
+            last_t[yi, xi] = ti
+    return keep
+
+
+def refractory_filter(events, height, width):
+    """Remove events at same pixel that occur within REFRACTORY_US of the previous (burst noise)."""
+    if REFRACTORY_US <= 0:
+        return np.ones(len(events), dtype=bool)
+    n = len(events)
+    if n == 0:
+        return np.ones(0, dtype=bool)
+    if not _NUMBA_AVAILABLE:
+        return np.ones(n, dtype=bool)
+    x = np.ascontiguousarray(events["x"], dtype=np.uint16)
+    y = np.ascontiguousarray(events["y"], dtype=np.uint16)
+    t = np.ascontiguousarray(events["t"], dtype=np.int64)
+    return _refractory_filter_numba(x, y, t, height, width, REFRACTORY_US)
+
+
+def micro_activity_filter(events, height, width):
+    """Keep event only if it has very close neighbors in time (5ms, 3x3) – true clusters are dense."""
+    return _sliding_window_filter(
+        events, height, width,
+        MICRO_ACTIVITY_WINDOW_US, MICRO_ACTIVITY_RADIUS,
+        MICRO_ACTIVITY_MIN_COUNT - 1,
+    )
+
+
 def _sliding_window_filter(events, height, width, window_us, radius, min_count_strict):
     """Use Numba JIT if available (fast), else Python fallback."""
     n = len(events)
@@ -359,6 +522,9 @@ ACTIVITY_PARALLEL_MIN_EVENTS = 200_000
 COMBINED_PARALLEL_CHUNKS = 6
 # Min events to use parallel combined filter.
 COMBINED_PARALLEL_MIN_EVENTS = 200_000
+# Neighborhood filter: parallel time-chunks (same idea as activity; speeds up standalone neighborhood).
+NEIGHBOR_PARALLEL_CHUNKS = 8
+NEIGHBOR_PARALLEL_MIN_EVENTS = 200_000
 
 
 def _kdtree_spatiotemporal_filter(events, window_us, spatial_radius, min_count, label=""):
@@ -407,7 +573,7 @@ def _kdtree_spatiotemporal_filter(events, window_us, spatial_radius, min_count, 
 
 
 def activity_filter(events, height, width):
-    """Keep event only if there is at least one similar event in 500ms and 10x10 neighborhood."""
+    """Keep event only if there is at least one similar event in ACTIVITY_WINDOW_US (200ms) and 10x10 neighborhood."""
     if USE_NUMBA_FOR_ACTIVITY and _NUMBA_AVAILABLE:
         n = len(events)
         use_parallel = (
@@ -491,7 +657,7 @@ def _combined_filter_numba_parallel(events, height, width):
 
 def combined_activity_neighborhood_filter(events, height, width):
     """
-    Single pass: activity (500ms, 10x10, >=2) and neighborhood (200ms, 3x3, >3).
+    Single pass: activity (ACTIVITY_WINDOW_US, 10x10, >=2) and neighborhood (200ms, 3x3, >3).
     Keep event only if both pass. Returns keep mask or None if not using Numba.
     Uses parallel time-chunks when COMBINED_PARALLEL_CHUNKS > 1 and event count >= COMBINED_PARALLEL_MIN_EVENTS.
     """
@@ -515,9 +681,59 @@ def combined_activity_neighborhood_filter(events, height, width):
     )
 
 
+def _neighborhood_filter_numba_parallel(events, height, width):
+    """Run neighborhood filter in parallel over time chunks (Numba releases GIL)."""
+    n = len(events)
+    t = np.ascontiguousarray(events["t"], dtype=np.int64)
+    x = np.ascontiguousarray(events["x"], dtype=np.uint16)
+    y = np.ascontiguousarray(events["y"], dtype=np.uint16)
+    window_us = NEIGHBOR_WINDOW_US
+    t_min, t_max = int(t[0]), int(t[-1])
+    chunk_duration_us = max(window_us * 2, (t_max - t_min) // max(1, NEIGHBOR_PARALLEL_CHUNKS))
+    n_chunks = max(1, (t_max - t_min + chunk_duration_us - 1) // chunk_duration_us)
+
+    def run_chunk(chunk_i):
+        c_start = t_min + chunk_i * chunk_duration_us
+        c_end = (
+            t_max + 1
+            if chunk_i == n_chunks - 1
+            else min(t_min + (chunk_i + 1) * chunk_duration_us, t_max + 1)
+        )
+        pad_start = np.searchsorted(t, c_start - window_us, side="left")
+        pad_end = np.searchsorted(t, c_end + window_us, side="right")
+        inner_start = np.searchsorted(t, c_start, side="left")
+        inner_end = np.searchsorted(t, c_end, side="left")
+        if inner_start >= inner_end:
+            return inner_start, inner_end, np.ones(0, dtype=np.bool_)
+        x_c = x[pad_start:pad_end]
+        y_c = y[pad_start:pad_end]
+        t_c = t[pad_start:pad_end]
+        keep_c = _sliding_window_filter_numba(
+            x_c, y_c, t_c, height, width,
+            NEIGHBOR_WINDOW_US, NEIGHBOR_RADIUS,
+            NEIGHBOR_MIN_COUNT,
+        )
+        return inner_start, inner_end, keep_c[inner_start - pad_start : inner_end - pad_start]
+
+    keep = np.ones(n, dtype=bool)
+    with ThreadPoolExecutor(max_workers=min(NEIGHBOR_PARALLEL_CHUNKS, n_chunks)) as ex:
+        futures = [ex.submit(run_chunk, i) for i in range(n_chunks)]
+        for f in as_completed(futures):
+            i_start, i_end, k = f.result()
+            keep[i_start:i_end] = k
+    return keep
+
+
 def neighborhood_filter(events, height, width):
     """Keep event only if sum of events in 3x3 over 200ms is > 3."""
     if USE_NUMBA_FOR_NEIGHBORHOOD and _NUMBA_AVAILABLE:
+        n = len(events)
+        use_parallel = (
+            n >= NEIGHBOR_PARALLEL_MIN_EVENTS and NEIGHBOR_PARALLEL_CHUNKS > 1
+        )
+        if use_parallel:
+            print("    Neighborhood filter: using Numba (parallel sliding-window)")
+            return _neighborhood_filter_numba_parallel(events, height, width)
         print("    Neighborhood filter: using Numba (sliding-window)")
         return _sliding_window_filter(
             events, height, width,
@@ -571,11 +787,12 @@ def load_events_from_raw(raw_path, hot_pixels=None, delta_t_us=DELTA_T_US):
 
 def filter_and_save_raw(
     input_raw_path, output_raw_path, hot_pixels, width, height,
-    apply_activity=True, apply_neighborhood=False,
+    apply_activity=True, apply_neighborhood=True, apply_flicker=True,
+    apply_micro_activity=True, apply_refractory=True,
 ):
     """
-    Load events from RAW, remove hot pixels, apply activity filter (500ms 10x10) only by default.
-    Set apply_neighborhood=True to also apply neighborhood (200ms 3x3).
+    Load events from RAW, remove hot pixels, then apply (in order):
+    activity, micro_activity (5ms 3x3), neighborhood, flicker, refractory (same-pixel dead time).
     Returns (width, height, stats) where stats is a dict with n_original, n_filtered, t_min_us, t_max_us.
     """
     print("  Loading events...")
@@ -588,6 +805,18 @@ def filter_and_save_raw(
         t_max_us = int(events["t"][-1])
     t_original_min_us = t_min_us
     t_original_max_us = t_max_us
+    # Trim first TRIM_FIRST_S seconds of events (e.g. discard warm-up)
+    if TRIM_FIRST_S > 0 and n0 > 0:
+        t_cut_us = t_original_min_us + TRIM_FIRST_S * 1_000_000
+        events = events[events["t"] >= t_cut_us]
+        events = np.sort(events, order="t")
+        n0 = len(events)
+        if n0 > 0:
+            t_min_us = int(events["t"][0])
+            t_max_us = int(events["t"][-1])
+        else:
+            t_min_us = t_max_us = t_cut_us
+        print(f"  Trimmed first {TRIM_FIRST_S} s; {n0:,} events remaining.")
     if n0 == 0:
         writer = RAWEvt2EventFileWriter(
             width, height, output_raw_path,
@@ -608,35 +837,48 @@ def filter_and_save_raw(
         backends.append("Python fallback")
     print("  Filter backends available:", ", ".join(backends))
     print(f"  Events before filtering: {n0:,}")
-    if apply_activity and apply_neighborhood and _NUMBA_AVAILABLE:
-        parallel = n0 >= COMBINED_PARALLEL_MIN_EVENTS and COMBINED_PARALLEL_CHUNKS > 1
-        print(
-            "  Applying combined activity + neighborhood filter (single pass: 500ms 10x10 + 200ms 3x3"
-            + (" parallel)" if parallel else ")")
-            + "..."
-        )
-        keep = combined_activity_neighborhood_filter(events, height, width)
-        if keep is not None:
-            events = events[keep]
-            print(f"    After combined filter: {len(events)} events (was {n0})")
-        else:
-            keep = activity_filter(events, height, width)
-            events = events[keep]
-            n1 = len(events)
-            if n1 > 0:
-                keep = neighborhood_filter(events, height, width)
-                events = events[keep]
-            print(f"    After activity + neighborhood (two passes): {len(events)} events (was {n0})")
-    elif apply_activity:
-        print("  Applying activity filter (500ms, 10x10)...")
+    # Run each enabled filter in sequence and report how many each removes
+    n_before = n0
+    if apply_activity:
+        print(f"  Applying activity filter ({ACTIVITY_WINDOW_US // 1000}ms, {2*ACTIVITY_RADIUS+1}x{2*ACTIVITY_RADIUS+1})...")
         keep = activity_filter(events, height, width)
         events = events[keep]
-        print(f"    After activity filter: {len(events)} events (was {n0})")
-    elif apply_neighborhood and len(events) > 0:
-        print("  Applying neighborhood filter (200ms, 3x3, count > 3)...")
+        n_after = len(events)
+        removed = n_before - n_after
+        print(f"    After activity: {n_after:,} events (removed {removed:,}, {100.0 * removed / n_before:.1f}%)")
+        n_before = n_after
+    if apply_micro_activity and len(events) > 0:
+        print(f"  Applying micro-activity filter ({MICRO_ACTIVITY_WINDOW_US // 1000}ms, {2*MICRO_ACTIVITY_RADIUS+1}x{2*MICRO_ACTIVITY_RADIUS+1})...")
+        keep = micro_activity_filter(events, height, width)
+        events = events[keep]
+        n_after = len(events)
+        removed = n_before - n_after
+        print(f"    After micro-activity: {n_after:,} events (removed {removed:,}, {100.0 * removed / n_before:.1f}%)")
+        n_before = n_after
+    if apply_neighborhood and len(events) > 0:
+        print("  Applying neighborhood filter (200ms, 3x3)...")
         keep = neighborhood_filter(events, height, width)
         events = events[keep]
-        print(f"    After neighborhood filter: {len(events)} events (was {n0})")
+        n_after = len(events)
+        removed = n_before - n_after
+        print(f"    After neighborhood: {n_after:,} events (removed {removed:,}, {100.0 * removed / n_before:.1f}%)")
+        n_before = n_after
+    if apply_flicker and len(events) > 0 and _NUMBA_AVAILABLE:
+        print("  Applying flicker filter (isolated ON-OFF pairs)...")
+        keep = flicker_filter(events, height, width)
+        events = events[keep]
+        n_after = len(events)
+        removed = n_before - n_after
+        print(f"    After flicker: {n_after:,} events (removed {removed:,}, {100.0 * removed / n_before:.1f}%)")
+        n_before = n_after
+    if apply_refractory and len(events) > 0 and REFRACTORY_US > 0:
+        print(f"  Applying refractory filter ({REFRACTORY_US} us same-pixel dead time)...")
+        keep = refractory_filter(events, height, width)
+        events = events[keep]
+        n_after = len(events)
+        removed = n_before - n_after
+        print(f"    After refractory: {n_after:,} events (removed {removed:,}, {100.0 * removed / n_before:.1f}%)")
+        n_before = n_after
     n_filtered = len(events)
     if n_filtered > 0:
         t_min_us = int(events["t"][0])
@@ -781,7 +1023,8 @@ def events_to_mp4(event_file_path, mp4_path, width, height, t_start_us=None, t_e
     Streams frames to disk as they are generated (when using OpenCV) to save memory and time.
     ON (polarity 1) = white, OFF (polarity 0) = blue.
     If t_start_us and t_end_us are provided, generates frames for the full time range so video
-    duration matches the recording (empty slices yield blank frames).
+    duration matches the recording. Empty time slices get one tick event at (0,0) so the frame
+    generator advances; you may see a faint line at the corner.
     """
     frame_gen = PeriodicFrameGenerationAlgorithm(
         sensor_width=width,
@@ -836,11 +1079,20 @@ def events_to_mp4(event_file_path, mp4_path, width, height, t_start_us=None, t_e
             events_all = np.concatenate(chunks)
             events_all = np.sort(events_all, order="t")
             t_arr = events_all["t"]
+            ev_dtype = events_all.dtype
+            # One tick event per empty slice so the frame generator advances (full 10s video).
+            tick_ev = np.zeros(1, dtype=ev_dtype)
+            tick_ev["x"][0] = 0
+            tick_ev["y"][0] = 0
+            tick_ev["p"][0] = 0
             ts = int(t_start_us)
             while ts < t_end_us:
                 end_ts = min(ts + DELTA_T_US, t_end_us)
                 mask = (t_arr >= ts) & (t_arr < end_ts)
                 evs = events_all[mask]
+                if evs.size == 0:
+                    tick_ev["t"][0] = ts
+                    evs = tick_ev
                 frame_gen.process_events(evs)
                 ts = end_ts
         else:
@@ -917,10 +1169,10 @@ def main():
         del mv_it
         hot_pixels = set()
         original_size_bytes = os.path.getsize(raw_path)
-        print(f"Filtering (activity only) and writing to RAW: {raw_path}")
+        print(f"Filtering (activity + neighborhood + flicker) and writing to RAW: {raw_path}")
         width, height, stats = filter_and_save_raw(
             raw_path, filtered_raw_path, hot_pixels, width, height,
-            apply_activity=True, apply_neighborhood=False,
+            apply_activity=False, apply_neighborhood=False, apply_flicker=False,
         )
         n_orig, n_filt = stats["n_original"], stats["n_filtered"]
         t_min, t_max = stats["t_min_us"], stats["t_max_us"]
@@ -938,12 +1190,13 @@ def main():
         if n_filt == 0:
             print("No events after filtering; skipping MP4.")
         else:
-            print("Rendering event stream to MP4 (full recording duration)...")
+            print("Rendering event stream to MP4 (trimmed duration)...")
             t_orig_min = stats.get("t_original_min_us")
             t_orig_max = stats.get("t_original_max_us")
+            t_start = t_orig_min + TRIM_FIRST_S * 1_000_000 if TRIM_FIRST_S > 0 else t_orig_min
             events_to_mp4(
                 filtered_raw_path, mp4_path, width, height,
-                t_start_us=t_orig_min, t_end_us=t_orig_max,
+                t_start_us=t_start, t_end_us=t_orig_max,
             )
             print("MP4 saved to", mp4_path)
             print("Displaying MP4...")
@@ -992,7 +1245,7 @@ def main():
             print("  (Prophesee: run 'metavision_active_pixel_detection' to detect and save calibration;")
             print("   for GenX320 use default calib path; for Gen4.1/IMX636 use Digital Event Mask in camera settings.)")
 
-    # 2) Record 10 seconds (iterator drives stream so data is written)
+    # 2) Record 11 seconds (iterator drives stream so data is written)
     print(f"Recording main sequence for {RECORD_DURATION_S} seconds...")
     width, height = record_seconds(device, raw_path, duration_s=RECORD_DURATION_S)
     if not os.path.isfile(raw_path):
@@ -1002,13 +1255,15 @@ def main():
         )
     print("Recording saved to", raw_path)
 
-    # 3) Apply activity filter only; software hot-pixel removal if hardware mask was not applied
+    # 3) Apply activity, neighborhood, and flicker filters; report how much each removes
     hot_pixels_for_load = None if mask_applied else hot_pixels
     original_size_bytes = os.path.getsize(raw_path)
-    print("Filtering (activity only) and writing to RAW...")
+    print("Filtering (activity + neighborhood + flicker) and writing to RAW...")
     width, height, stats = filter_and_save_raw(
         raw_path, filtered_raw_path, hot_pixels_for_load, width, height,
-        apply_activity=True, apply_neighborhood=False,
+        apply_activity=True,
+        apply_neighborhood=False, apply_flicker=False,
+        apply_micro_activity=False, apply_refractory=False,
     )
     filtered_size_bytes = os.path.getsize(filtered_raw_path)
     n_orig, n_filt = stats["n_original"], stats["n_filtered"]
@@ -1040,12 +1295,13 @@ def main():
         print("No events after filtering; skipping MP4 render and display.")
         print("If recording produced an empty file, record a RAW file with the Metavision app or metavision_file_recorder, then run: python record_filter_display.py -i <file.raw>")
     else:
-        print("Rendering event stream to MP4 (full recording duration)...")
+        print("Rendering event stream to MP4 (trimmed duration)...")
         t_orig_min = stats.get("t_original_min_us")
         t_orig_max = stats.get("t_original_max_us")
+        t_start = t_orig_min + TRIM_FIRST_S * 1_000_000 if TRIM_FIRST_S > 0 else t_orig_min
         events_to_mp4(
             filtered_raw_path, mp4_path, width, height,
-            t_start_us=t_orig_min, t_end_us=t_orig_max,
+            t_start_us=t_start, t_end_us=t_orig_max,
         )
         print("MP4 saved to", mp4_path)
         print("Displaying MP4...")
